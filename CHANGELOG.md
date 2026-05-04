@@ -2,6 +2,10 @@
 
 All changes we make to the assignment code or PDF will be documented in this file.
 
+## [26.0.2] - 2026-05-04
+
+- code: remove max runtime from training config to allow 48 hour final submission
+
 ## [26.0.1] - 2026-05-01
 
 - writeup: add AI policy

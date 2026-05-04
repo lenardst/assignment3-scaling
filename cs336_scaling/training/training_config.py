@@ -19,7 +19,7 @@ class TrainingConfig(FrozenForbidExtraModel):
     n_val_tokens: ClassVar[int] = 2**18
     n_evals: int = Field(default=16, gt=0)
     total_train_tokens: int = Field(gt=0, le=500_000_000_000)
-    max_runtime_seconds: float = Field(ge=1, le=60 * 60 * 12)
+    max_runtime_seconds: float = Field(ge=1)
     model_seed: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
