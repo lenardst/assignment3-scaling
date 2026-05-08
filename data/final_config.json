@@ -1,0 +1,50 @@
+{
+  "config": {
+    "architecture_config": {
+      "attention_bias": false,
+      "head_dim": 64,
+      "hidden_size": 1088,
+      "intermediate_size": 3072,
+      "num_attention_heads": 17,
+      "num_hidden_layers": 22,
+      "num_key_value_heads": 17,
+      "rms_norm_eps": 1e-06,
+      "rope_theta": 1000000,
+      "tie_word_embeddings": false,
+      "dtype": "bfloat16",
+      "vocab_size": 32000
+    },
+    "optimizer_config": {
+      "lr_scheduler": {
+        "peak_value": 0.0006902884348715243,
+        "final_lr_frac": 0.1,
+        "warmup_frac": 0.05,
+        "init_value": 0.0
+      },
+      "weight_decay": 0.01,
+      "beta1": 0.9,
+      "beta2": 0.95,
+      "eps": 1e-08,
+      "eps_root": 1e-08,
+      "grad_clip_norm": 1.0
+    },
+    "train_batch_size": 128,
+    "val_batch_size": 32,
+    "n_evals": 16,
+    "total_train_tokens": 16588472320,
+    "max_runtime_seconds": 172800.0,
+    "model_seed": 0
+  },
+  "predicted_final_loss": 3.4050702054461546,
+  "rationale": "D scaled to 80% of MFU=0.05 budget to leave wall-clock slack",
+  "fit": {
+    "E": 3.3762035830784183,
+    "A": 9660076.709827533,
+    "B": 9644429.998141874,
+    "alpha": 1.0485634075414603,
+    "beta": 0.856778695789776
+  },
+  "N": 312508416,
+  "D": 16588472320,
+  "peak_lr": 0.0006902884348715243
+}

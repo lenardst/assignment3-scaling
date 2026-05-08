@@ -28,7 +28,7 @@
     \label{fig:model-size-scaling}
 \end{figure}
 
-At $C = 10^{23}$ FLOPs the best model size is $7.0 \times 10^{10}$ parameters. At $C = 10^{24}$ FLOPs it is $2.1 \times 10^{11}$ parameters.
+I read the fitted power law from the IsoFLOPs analysis at the two budgets of interest. At $C = 10^{23}$ FLOPs the best model size is $7.0 \times 10^{10}$ parameters. At $C = 10^{24}$ FLOPs it is $2.1 \times 10^{11}$ parameters.
 
 \subsection*{(b) Optimal Dataset Size}
 
@@ -40,28 +40,27 @@ At $C = 10^{23}$ FLOPs the best model size is $7.0 \times 10^{10}$ parameters. A
     \label{fig:dataset-size-scaling}
 \end{figure}
 
-At $C = 10^{23}$ FLOPs the best dataset size is $2.4 \times 10^{11}$ tokens. At $C = 10^{24}$ FLOPs it is $8.1 \times 10^{11}$ tokens.
+The same procedure for data size gives $2.4 \times 10^{11}$ tokens at $C = 10^{23}$ FLOPs and $8.1 \times 10^{11}$ tokens at $C = 10^{24}$ FLOPs.
 
 % ============================================================
 \section{Constructing Scaling Laws (\texttt{scaling\_laws})}
 % ============================================================
 
-\subsection{Experimental Design}
+\subsection{What I did and why}
 
-I split a 12-hour B200 budget into three phases. The plan follows Kaplan et al.~\cite{kaplan2020}, Hoffmann et al.~\cite{hoffmann2022}, and Yang et al.~\cite{yang2022}. First I ran one short job. It checked the API, the logging path, and how much of peak FLOPs the cluster reached in practice (MFU).
+I had a 12-hour B200 budget. I split the work into three phases so that I could tune the learning rate cheaply, then transfer it to wider models, and only then spend the bulk of the budget on points for a scaling law. The overall logic follows Kaplan et al.~\cite{kaplan2020}, Hoffmann et al.~\cite{hoffmann2022}, and Yang et al.~\cite{yang2022}, but each step below states what I chose and why.
 
-\paragraph{Phase 1: learning rate on a small model.}
-I need one learning rate for all later runs. I tuned it on the smallest model allowed by the API: $\texttt{hidden\_size} = \texttt{num\_attention\_heads} \cdot \texttt{head\_dim}$ with $\texttt{head\_dim} = 64$. That model has $d_\text{model} = 128$, $L = 2$, and $1.77\,\text{M}$ non-embedding parameters. I tried nine learning rates on a log grid from $3 \times 10^{-4}$ to $3 \times 10^{-1}$. Each run used about $16\,\text{M}$ tokens and a cosine schedule over that length (Hoffmann et al.~\cite{hoffmann2022}, their Approach~3). I set the upper rate high on purpose so the largest value would fail. That way the best rate sits inside the grid, not on the edge.
+Before the main pipeline I ran one short job. I did this so that I would not waste hours on a broken API contract, a broken result path, or a wrong guess about how fast the cluster really trains (MFU). That run gave me a sanity check on all three.
 
-\paragraph{Phase 2: how learning rate scales with width.}
-Yang et al.~\cite{yang2022} describe $\mu$P, where the best learning rate does not depend on width. The full recipe needs options the assignment API does not expose. I used the simpler width-scaling rule from Yang et al.~\cite{yang2022} (Section~6) and Hoffmann et al.~\cite{hoffmann2022}:
+For Phase~1 I needed a single peak learning rate to reuse everywhere. Tuning it on a tiny model is cheap. I used the smallest architecture the API allows: $\texttt{hidden\_size} = \texttt{num\_attention\_heads} \cdot \texttt{head\_dim}$ with $\texttt{head\_dim} = 64$, which gives $d_\text{model} = 128$, $L = 2$, and $1.77\,\text{M}$ non-embedding parameters. I swept nine learning rates on a log-spaced grid from $3 \times 10^{-4}$ to $3 \times 10^{-1}$. Each run trained on about $16\,\text{M}$ tokens with a cosine schedule matched to that length, as in Hoffmann et al.~\cite{hoffmann2022} (Approach~3). I set the top of the sweep high enough that the largest rate would diverge. If the best value sat on the upper edge, I would not know whether a higher rate could be better; an interior optimum is easier to trust.
+
+Phase~2 had to tell me how to scale that rate when $d_\text{model}$ grows. Yang et al.~\cite{yang2022} justify $\mu$P, where the optimal rate is width-invariant, but the full setup is not available through the assignment API. I therefore used the simpler width scaling they and Hoffmann et al.~\cite{hoffmann2022} discuss,
 \begin{equation}
-    \eta(d) = \eta_\text{proxy} \cdot \left( \frac{d_\text{proxy}}{d} \right)^{\!\gamma}.
+    \eta(d) = \eta_\text{proxy} \cdot \left( \frac{d_\text{proxy}}{d} \right)^{\!\gamma},
 \end{equation}
-I treat $\gamma$ as a number to fit from data. I tried three learning rates at $d_\text{model} \in \{320, 512\}$ around the common guess $\gamma = 1.0$. The first grids put the best rate at the low end ($\times 0.5/\times 1/\times 2$). I added a second round at $\times 0.25$ and $\times 0.5$ of the previous best. After that, the best rate lay inside the grid for both widths.
+and I estimated $\gamma$ from data instead of fixing it to the common guess $\gamma = 1$. I ran small grids of three rates at $d_\text{model} \in \{320, 512\}$, centered on the prediction from $\gamma = 1$. Both first grids put the winner at the low end ($\times 0.5/\times 1/\times 2$ relative to a center), so I ran a second pass at $\times 0.25$ and $\times 0.5$ around the previous best. I stopped once both widths had an interior best, because then the estimate of $\gamma$ is not pinned to a grid edge.
 
-\paragraph{Phase 3: scaling-law data.}
-I fixed $\eta_\text{proxy}$ and $\gamma$. I trained six model families from $1.77\,\text{M}$ to $116\,\text{M}$ non-embedding parameters. Compute targets were $C \in \{10^{18}, 3\times 10^{18}, 10^{19}\}$ FLOPs (Table~\ref{tab:phase3-design}). I kept depth and width near $d_\text{model}/L \approx 50$. Kaplan et al.~\cite{kaplan2020} show that shape matters little at fixed parameter count. Two compute levels ($10^{18}$ and $3\times 10^{18}$) have at least four families each. That lets me compare IsoFLOPs points to the parametric fit (Hoffmann et al.~\cite{hoffmann2022} Approach~2).
+For Phase~3 I froze $\eta_\text{proxy}$ from Phase~1 and $\gamma$ from Phase~2. I trained six model families from $1.77\,\text{M}$ to $116\,\text{M}$ non-embedding parameters at compute targets $C \in \{10^{18}, 3\times 10^{18}, 10^{19}\}$ FLOPs; the exact pairing of family and $C$ is in Table~\ref{tab:phase3-design}. I kept $d_\text{model}/L \approx 50$ because Kaplan et al.~\cite{kaplan2020} find that aspect ratio moves results only weakly at fixed parameter count, so I did not want to spend budget on exotic shapes. I also made sure that at $10^{18}$ and $3\times 10^{18}$ FLOPs at least four families appear. Hoffmann et al.~\cite{hoffmann2022} (Approach~2) use IsoFLOPs cuts to check a parametric fit; with several families at the same $C$ I can make the same kind of comparison.
 
 \begin{table}[H]
     \centering
@@ -81,48 +80,41 @@ I fixed $\eta_\text{proxy}$ and $\gamma$. I trained six model families from $1.7
     \label{tab:phase3-design}
 \end{table}
 
-\paragraph{Budget handling.}
-The API reserves wall time up to \texttt{max\_runtime\_seconds} when a job starts. It returns unused time when the job ends. I set \texttt{max\_runtime} to $\texttt{safety\_factor} \cdot C / (\texttt{MFU} \cdot \texttt{peak\_FLOPs})$ with $\texttt{MFU} = 0.4$ and $\texttt{safety\_factor} = 1.5$. Values above the two-hour cap were clipped. I submitted Phase 3 in three batches (five, five, three runs). Earlier batches freed budget before the next batch started.
+The hosted API reserves \texttt{max\_runtime\_seconds} up front and refunds what I do not use. I set each job's cap from $\texttt{safety\_factor} \cdot C / (\texttt{MFU} \cdot \texttt{peak\_FLOPs})$ with $\texttt{MFU} = 0.4$ and $\texttt{safety\_factor} = 1.5$, clipped at two hours, so that planned training had headroom against slowdowns. I still submitted Phase~3 in three waves (five, five, three jobs) so refunds from finished runs returned budget before I queued the next wave. That order was a practical way to stay inside the 12-hour pool without hand-tuning every reservation.
 
-\subsection{Phase 1 \& 2 Results}
+\subsection{Phase 1 and Phase 2 outcomes}
 
-The small-model sweep peaked at $\eta_\text{proxy} = 2.25 \times 10^{-2}$ (validation loss $5.85$). The endpoints $3 \times 10^{-4}$ and $3 \times 10^{-1}$ were worse ($7.98$ and $6.68$). So the grid surrounds the best value.
+Phase~1 peaked at $\eta_\text{proxy} = 2.25 \times 10^{-2}$ with validation loss $5.85$. The endpoints $3 \times 10^{-4}$ and $3 \times 10^{-1}$ landed at $7.98$ and $6.68$, so the best point is clearly inside the sweep.
 
-Phase 2 gave best rates $4.50 \times 10^{-3}$ at $d_\text{model} = 320$ and $2.81 \times 10^{-3}$ at $d_\text{model} = 512$. Plugging into the scaling law and averaging over the two widths,
+Phase~2 gave best rates $4.50 \times 10^{-3}$ at $d_\text{model} = 320$ and $2.81 \times 10^{-3}$ at $d_\text{model} = 512$. Averaging the implied $\gamma$ from both widths,
 \begin{equation}
     \gamma \;=\; \frac{1}{2} \sum_{d \in \{320,\, 512\}} \frac{\log\bigl(\eta(d)/\eta_\text{proxy}\bigr)}{\log(d_\text{proxy}/d)} \;=\; 1.628.
 \end{equation}
-This is larger than the often-used $\gamma = 1$. Yang et al.~\cite{yang2022} (Figure~1) show the simple scaling rule can shift the best rate by almost an order of magnitude when width grows. I use $\gamma = 1.628$ in Phase 3.
+That is steeper than $\gamma = 1$, but Yang et al.~\cite{yang2022} (Figure~1) already show that this simple rule can move the best rate by nearly an order of magnitude when width grows, so I did not treat $\gamma = 1$ as a hard truth. I carried $\gamma = 1.628$ into Phase~3.
 
-\subsection{Phase 3 Outcome and Anchor Calibration}
+\subsection{Phase 3, salvage, and the anchor check}
 
-All 13 Phase 3 runs hit the time cap. From eval throughput I estimated real MFU between $1.6\%$ and $4.7\%$. I had assumed $40\%$ for planning. Three smallest jobs logged no eval block. The other ten gave one to three partial validation losses each.
+Every Phase~3 run hit my wall-time cap. From eval throughput I inferred MFU between $1.6\%$ and $4.7\%$, far below the $40\%$ I assumed when sizing \texttt{max\_runtime}. Three of the smallest jobs never logged an eval block; ten others returned one to three partial validation losses.
 
-I still used the partial runs. For each I set trained tokens to $D_\text{actual} = (\texttt{evals\_completed} / 16) \cdot D_\text{planned}$. I fit the law on $(N, D_\text{actual}, L_\text{partial})$. Stopped runs may bias loss upward: the schedule was cut while the learning rate was still high.
+Dropping those runs would leave almost no data, so I kept them and estimated trained tokens as $D_\text{actual} = (\texttt{evals\_completed} / 16) \cdot D_\text{planned}$ for each job. I fit the law on $(N, D_\text{actual}, L_\text{partial})$. The worry is upward bias: if training stops while the cosine schedule is still near the peak rate, loss can look worse than for a run that decays on schedule.
 
-\paragraph{Anchor run.}
-I checked that on one setup: $(d_\text{model}, L) = (576, 10)$. I trained again with \texttt{total\_train\_tokens} equal to $D_\text{actual}$ from the truncated run. The cosine run could finish as intended (final LR $0.1\,\eta_\text{peak}$). The two losses match within $0.001$ nats:
-\begin{itemize}
-    \item Truncated run (high LR throughout): $L = 3.7820$.
-    \item Full schedule on $D_\text{actual}$: $L = 3.7813$.
-\end{itemize}
-The effect is tiny at this $(N, D)$. I fit using salvaged $D_\text{actual}$ values.
+I tested that worry on $(d_\text{model}, L) = (576, 10)$. I re-ran training with \texttt{total\_train\_tokens} set to the same $D_\text{actual}$ as the truncated job so the cosine could finish (final rate $0.1\,\eta_\text{peak}$). The truncated partial log gave $L = 3.7820$; the matched schedule gave $L = 3.7813$. The gap is $0.001$ nats, so at this $(N, D)$ the salvage choice does not materially shift the loss. I therefore kept $D_\text{actual}$ for the fit.
 
-\subsection{Fitting the Scaling Law}
+\subsection{Fitting the scaling law}
 
-I used Hoffmann et al.~\cite{hoffmann2022} Approach~3 (their Equations~2--3). The model is
+I followed Hoffmann et al.~\cite{hoffmann2022} Approach~3 (Equations~2--3),
 \begin{equation}
     \widehat{L}(N, D) \;=\; E + \frac{A}{N^{\alpha}} + \frac{B}{D^{\beta}}.
 \end{equation}
-I estimated $(E, A, B, \alpha, \beta)$ with Huber loss on log-residuals ($\delta = 10^{-3}$, as in Hoffmann et al.) and L-BFGS-B. I started from eight initial guesses: $\log E \in \{\log 1, \log 2\}$, $\alpha \in \{0.3, 0.5\}$, $\beta \in \{0.3, 0.5\}$. I kept the run with the lowest objective.
+I fit $(E, A, B, \alpha, \beta)$ by minimizing Huber loss on log-residuals with $\delta = 10^{-3}$, matching Hoffmann et al., using L-BFGS-B. Non-convex fits can land in local minima, so I repeated the fit from eight starting points covering $\log E \in \{\log 1, \log 2\}$, $\alpha \in \{0.3, 0.5\}$, and $\beta \in \{0.3, 0.5\}$, and I kept the solution with the lowest objective.
 
-On my ten salvaged points,
+On the ten salvaged Phase~3 points,
 \begin{equation*}
     E = 3.376, \quad A = 9.66 \times 10^{6}, \quad B = 9.64 \times 10^{6}, \quad \alpha = 1.049, \quad \beta = 0.857.
 \end{equation*}
-My fitted $\alpha$ and $\beta$ are larger than Hoffmann et al.~\cite{hoffmann2022}'s ($\alpha = 0.34$, $\beta = 0.28$). The ratio $\alpha/\beta = 1.22$ is almost the same as Chinchilla's $1.21$. The best split between $N$ and $D$ at fixed compute depends only on that ratio (Hoffmann et al.~\cite{hoffmann2022} Equation~5). So my allocation prediction matches theirs in that sense. The larger exponents likely come from my narrow $N$ range ($5.4\times$ here vs.\ $230\times$ in Hoffmann et al.).
+My $\alpha$ and $\beta$ exceed Hoffmann et al.~\cite{hoffmann2022}'s Chinchilla values ($\alpha = 0.34$, $\beta = 0.28$), but the ratio $\alpha/\beta = 1.22$ matches theirs ($1.21$) almost exactly. Hoffmann et al.~\cite{hoffmann2022} Equation~5 shows that the compute-optimal split between $N$ and $D$ depends only on $\alpha/\beta$, so my prediction for how to divide compute between model and data stays aligned with Chinchilla even though the raw exponents differ. The narrower $N$ span in my data ($5.4\times$ versus $230\times$ in Hoffmann et al.) is the natural reason the individual exponents look sharper.
 
-\subsection{Quality of Fit}
+\subsection{Quality of fit}
 
 \begin{figure}[H]
     \centering
@@ -131,26 +123,22 @@ My fitted $\alpha$ and $\beta$ are larger than Hoffmann et al.~\cite{hoffmann202
     \label{fig:scaling-law-fit}
 \end{figure}
 
-All ten residuals are small ($\max |r| = 0.048$ nats, RMSE $0.025$ nats); see Figure~\ref{fig:scaling-law-fit}. Two limits apply outside this range:
-\begin{itemize}
-    \item $N$ only spans $21.7\,\text{M}$ to $116\,\text{M}$ ($5.4\times$). Hoffmann et al.~\cite{hoffmann2022} stress that exponents depend strongly on the range.
-    \item Token counts give $D/N \in [12, 220]$. Most points are above the Chinchilla rule $D/N \approx 20$. Extrapolation to other $D/N$ may be weak.
-\end{itemize}
+Figure~\ref{fig:scaling-law-fit} shows that residuals stay small across the ten points ($\max |r| = 0.048$ nats, RMSE $0.025$ nats), so the parametric form describes my measured range well. I would still be cautious far outside it. My parameter counts only run from $21.7\,\text{M}$ to $116\,\text{M}$ ($5.4\times$), and Hoffmann et al.~\cite{hoffmann2022} warn that exponent estimates move a lot when the fit range is narrow. The observed $D/N$ ratios fall in $[12, 220]$ with most runs above the Chinchilla-optimal $D/N \approx 20$, so the surface may be less reliable if I extrapolate to very different data-to-parameter ratios.
 
-\subsection{Predicted Optimal Configuration for 48 B200-Hours}
+\subsection{Prediction for 48 B200-hours and why it changed}
 
-Hoffmann et al.~\cite{hoffmann2022} Equation~5 with unconstrained compute gives $N^{*} = 1.23 \times 10^{9}$ and $D^{*} = 1.05 \times 10^{11}$ for $7.78 \times 10^{20}$ FLOPs (48 B200-hours at peak). At measured MFU $\approx 5\%$ on my runs, that job would need about $211$ wall-clock hours. It does not fit the 48-hour limit.
+The unconstrained Hoffmann et al.~\cite{hoffmann2022} recipe at $7.78 \times 10^{20}$ FLOPs (48 B200-hours at peak) predicts $N^{*} = 1.23 \times 10^{9}$ and $D^{*} = 1.05 \times 10^{11}$. I could not use that plan: at the MFU I actually saw ($\approx 5\%$), finishing that training would need on the order of $211$ wall-clock hours, which breaks a 48-hour cap.
 
-I minimized $\widehat{L}(N, D)$ under $6 N D = M \cdot \texttt{peak\_FLOPs} \cdot 48\,\text{h}$. I set $M = 0.05$ from my $116\,\text{M}$-parameter runs. Larger models often get higher MFU on this hardware. I have no direct measure. I also reduced $D$ by $20\%$ vs.\ the constrained optimum to keep time slack ($\approx 9.6$ hours at $M = 0.05$).
+I therefore minimized $\widehat{L}(N, D)$ subject to $6 N D = M \cdot \texttt{peak\_FLOPs} \cdot 48\,\text{h}$. I set $M = 0.05$ from my largest completed runs ($116\,\text{M}$ parameters) because that is the only hard evidence I had; larger models often improve MFU on tensor cores, but guessing higher without measurements felt optimistic. I then shaved $D$ by $20\%$ below the constrained optimum to leave slack ($\approx 9.6$ hours at $M = 0.05$) so the cosine schedule can finish even if throughput is a bit worse than expected.
 
-Table~\ref{tab:hyperparameters} lists the result. Predicted validation loss:
+Table~\ref{tab:hyperparameters} lists the configuration. The implied validation loss from the fit is
 \begin{equation}
     L^{*} \;=\; \widehat{L}(3.13 \times 10^{8},\, 1.66 \times 10^{10}) \;=\; 3.4051.
 \end{equation}
 
-\subsection{Hyperparameter Choices}
+\subsection{Hyperparameters for the leaderboard run}
 
-I follow Kaplan et al.~\cite{kaplan2020} for depth and width. I follow Hoffmann et al.~\cite{hoffmann2022} for the schedule and optimizer: cosine to total tokens, $10\times$ LR decay, AdamW with $\beta_2 = 0.95$. Peak learning rate follows Yang et al.~\cite{yang2022} via the width rule with my $\gamma = 1.628$. That yields $\eta = 6.90 \times 10^{-4}$ from $\eta_\text{proxy} = 2.25 \times 10^{-2}$ at $d_\text{proxy} = 128$.
+I set depth and width in the spirit of Kaplan et al.~\cite{kaplan2020}. I matched Hoffmann et al.~\cite{hoffmann2022} on training mechanics: cosine to the full token count, $10\times$ LR decay, AdamW with $\beta_2 = 0.95$. Peak learning rate comes from Yang et al.~\cite{yang2022} through the width scaling with my measured $\gamma = 1.628$, giving $\eta = 6.90 \times 10^{-4}$ from $\eta_\text{proxy} = 2.25 \times 10^{-2}$ at $d_\text{proxy} = 128$.
 
 \begin{table}[H]
     \centering
