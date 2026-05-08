@@ -93,10 +93,25 @@ def make_training_config(hidden_size, num_hidden_layers, peak_lr,
     }
 
 
-# ─── Phase 1: LR sweep on proxy model ────────────────────────────────────────
+# ─── Smoke test ───────────────────────────────────────────────────────────────
+# Single cheap run submitted before any other phase.
+# Verifies: config schema is accepted, result dict matches extract_results_from_api,
+# and the harness actually trains. MFU can be estimated from wall-clock vs FLOPs.
+# If MFU < 0.3, the max_runtime caps in Phase 3 become dangerously tight.
+
+SMOKE_TEST_CONFIG = make_training_config(
+    hidden_size=PROXY_HIDDEN_SIZE,
+    num_hidden_layers=2,
+    peak_lr=4e-3,
+    total_train_tokens=round_tokens(2e6),   # resolves to D_MIN_TOKENS (4 eval blocks)
+    max_runtime_seconds=120,
+)
+
+
+# ─── Phase 1: LR sweep on proxy model ─────────────────────────────────────────
 # Tune LR on the smallest viable model. Under the SP approximation to muP,
-# the optimal LR here will be scaled down by d_model_proxy/d_model_target
-# when applied to larger models in Phase 3.
+# the optimal LR here will be scaled down by (d_proxy/d_target)^γ
+# when applied to larger models in Phases 2–3.
 #
 # LR range 3e-4 to 3e-1 (9 log-spaced points):
 #   Lower end (3e-4) trains slowly but converges — establishes a floor.
@@ -117,61 +132,104 @@ PHASE1_CONFIGS = [
 ]
 
 
-# ─── Phase 2: LR verification on intermediate model ──────────────────────────
-# After Phase 1, take the best LR, scale it by (128/320)^exponent, and test
-# that prediction plus one step up and one step down. If the middle run wins,
-# exponent=1.0 holds. Otherwise fit exponent from the two calibration points.
+# ─── Phase 2: LR-transfer exponent calibration ────────────────────────────────
+# The SP approximation scales LR as proxy_lr × (d_proxy / d_target)^γ.
+# μP theory predicts γ=1.0, but SP does not guarantee this — the exponent
+# must be measured empirically.
 #
-# d_model=320, 6 layers: ~57× more non-embedding params than the proxy model,
-# large enough that a wrong exponent creates a measurable gap; small enough
-# to run in under 10 minutes each.
+# We run two verification model sizes (320 and 512) to get two independent
+# calibration points for γ. For each size, we test the predicted LR plus one
+# step up and one step down (×0.5, ×1.0, ×2.0).
+#
+# After Phase 2, fit γ using fit_lr_exponent():
+#   γ = log(LR_opt(s) / proxy_optimal_lr) / log(PROXY_HIDDEN_SIZE / s)
+# for s ∈ {320, 512}. If the two estimates agree, γ is reliable.
+# If they disagree, use the average and flag the uncertainty.
+#
+# d_model=320, 6 layers: N ≈ 7.4M (4× larger width than proxy).
+# d_model=512, 8 layers: N ≈ 25.2M (4× larger again); second calibration anchor.
+
+PHASE2_VERIFICATION_SIZES = [
+    (320, 6),
+    (512, 8),
+]
+
 
 def make_phase2_configs(proxy_optimal_lr, lr_exponent=1.0):
-    scaled_lr = scale_learning_rate(proxy_optimal_lr, 320, lr_exponent)
-    return [
-        make_training_config(
-            hidden_size=320,
-            num_hidden_layers=6,
-            peak_lr=float(lr),
-            total_train_tokens=round_tokens(16e6),
-            max_runtime_seconds=600,
-        )
-        for lr in [scaled_lr / 2, scaled_lr, scaled_lr * 2]
+    configs = []
+    for hidden_size, num_hidden_layers in PHASE2_VERIFICATION_SIZES:
+        scaled_lr = scale_learning_rate(proxy_optimal_lr, hidden_size, lr_exponent)
+        for lr in [scaled_lr / 2, scaled_lr, scaled_lr * 2]:
+            configs.append(make_training_config(
+                hidden_size=hidden_size,
+                num_hidden_layers=num_hidden_layers,
+                peak_lr=float(lr),
+                total_train_tokens=round_tokens(16e6),
+                max_runtime_seconds=600,
+            ))
+    return configs
+
+
+def fit_lr_exponent(proxy_optimal_lr, phase2_optimal_lrs):
+    """Fit γ from Phase 2 calibration points.
+
+    Args:
+        proxy_optimal_lr: best LR found in Phase 1 at d_model=128.
+        phase2_optimal_lrs: dict of {hidden_size: best_lr} from Phase 2.
+
+    Returns:
+        Mean γ across all calibration sizes.
+    """
+    exponents = [
+        np.log(best_lr / proxy_optimal_lr) / np.log(PROXY_HIDDEN_SIZE / hidden_size)
+        for hidden_size, best_lr in phase2_optimal_lrs.items()
     ]
+    return float(np.mean(exponents))
 
 
-# ─── Phase 3: Scaling law sweep ──────────────────────────────────────────────
-# Five model families spanning ~40× in non-embedding parameters (1.8M–71.5M).
-# The Chinchilla parametric fit has 5 free parameters (E, A, B, α, β), so 5
-# distinct N values is the bare minimum; using 14 runs total gives redundancy.
+# ─── Phase 3: Scaling law sweep ───────────────────────────────────────────────
+# Six model families spanning 64× in non-embedding parameters (1.8M–116.4M).
+# The new (832, 14) family replaces the two small-compute (192, 4) runs and
+# extends the upper end of the fit toward the leaderboard target (~300M–1B),
+# reducing the extrapolation gap from ~15× to ~4×.
+# The (192, 4) family is retained at one compute level to anchor the fit
+# in the small-N regime where A/N^α dominates.
 #
-# Depth/width chosen to roughly follow Kaplan et al.'s near-optimal shape
-# (layers ≈ hidden_size / 48) while keeping num_heads = hidden_size / 64
-# as a valid integer.
+# IsoFLOPs coverage (families at each compute level):
+#   C = 1e18:  (192), (320), (448), (576), (832)         — 5 families
+#   C = 3e18:  (320), (448), (576), (704), (832)          — 5 families  ← best
+#   C = 1e19:  (448), (576), (704)                        — 3 families
 #
-# The example config (448, 9) is included as family 3 so leaderboard runs can
-# reuse those results.
-#
-# Compute levels per family:
-#   - Three levels spanning ~10–30× so the loss curve's shape is well-sampled.
-#   - Absolute levels chosen so D = C / (6N) >= D_MIN_TOKENS after rounding.
-#   - The largest family (704, 12) gets only two levels because C=3e19 would
-#     exceed the 2-hour per-run cap and consume too much of the total budget.
+# At the two richest compute levels, all five N-values from 7.4M to 116.4M
+# are represented, enabling IsoFLOPs parabola fits as a cross-check on the
+# parametric Chinchilla fit.
 
 SCALING_FAMILIES = [
-    (192,  4),   # N ≈  1.8M
-    (320,  6),   # N ≈  7.4M
-    (448,  9),   # N ≈ 21.7M  (example config architecture)
-    (576, 10),   # N ≈ 39.8M
-    (704, 12),   # N ≈ 71.5M
+    (192,  4),   # N ≈   1.8M  (one level; anchors A/N^α in the small-N regime)
+    (320,  6),   # N ≈   7.4M
+    (448,  9),   # N ≈  21.7M  (example config architecture)
+    (576, 10),   # N ≈  39.8M
+    (704, 12),   # N ≈  71.5M
+    (832, 14),   # N ≈ 116.4M  (new; num_heads = 13; reduces extrapolation gap)
 ]
 
 COMPUTE_LEVELS_PER_FAMILY = {
-    (192,  4): [3e17, 1e18, 3e18],
-    (320,  6): [3e17, 1e18, 3e18],
+    # One level only: this small model needs no D-sweep since A/N^α dominates
+    # at any reasonable D. C=1e18 gives D/N≈53 (overtrained), which is exactly
+    # where the N-scaling signal is cleanest.
+    (192,  4): [1e18],
+    # Two levels from 1e18 to 3e18: cheaper family; both within the 2-hour cap.
+    (320,  6): [1e18, 3e18],
+    # Three levels: spans 10× in compute; this family also serves as the
+    # "example config" checkpoint.
     (448,  9): [1e18, 3e18, 1e19],
     (576, 10): [1e18, 3e18, 1e19],
+    # Two levels: C=1e19 is the practical ceiling before the 2-hour cap bites
+    # at MFU < 0.35.
     (704, 12): [3e18, 1e19],
+    # Two levels: upper end at 3e18 keeps well under the 2-hour cap even at
+    # MFU=0.25, avoiding the risk of a truncated cosine schedule.
+    (832, 14): [1e18, 3e18],
 }
 
 
@@ -195,6 +253,15 @@ def make_phase3_configs(proxy_optimal_lr, lr_exponent=1.0):
 
 if __name__ == "__main__":
     print("=" * 60)
+    print("SMOKE TEST")
+    print("=" * 60)
+    lr = SMOKE_TEST_CONFIG["optimizer_config"]["lr_scheduler"]["peak_value"]
+    tokens = SMOKE_TEST_CONFIG["total_train_tokens"]
+    print(f"  peak_lr={lr:.2e}  tokens={tokens:,}  "
+          f"max_runtime={SMOKE_TEST_CONFIG['max_runtime_seconds']:.0f}s")
+
+    print()
+    print("=" * 60)
     print("PHASE 1 — LR sweep on proxy model (d_model=128, 2 layers)")
     print("=" * 60)
     for cfg in PHASE1_CONFIGS:
@@ -204,19 +271,25 @@ if __name__ == "__main__":
 
     print()
     print("=" * 60)
-    print("PHASE 2 — LR verification (d_model=320, 6 layers)")
-    print("(shown with placeholder proxy_lr=5e-3)")
+    print("PHASE 2 — LR exponent calibration (d_model=320 and 512)")
+    print("(shown with placeholder proxy_lr=5e-3, exponent=1.0)")
     print("=" * 60)
     for cfg in make_phase2_configs(proxy_optimal_lr=5e-3):
+        arch = cfg["architecture_config"]
         lr = cfg["optimizer_config"]["lr_scheduler"]["peak_value"]
-        print(f"  peak_lr={lr:.2e}  tokens={cfg['total_train_tokens']:,}  max_runtime={cfg['max_runtime_seconds']:.0f}s")
+        print(f"  d_model={arch['hidden_size']}  peak_lr={lr:.2e}  "
+              f"tokens={cfg['total_train_tokens']:,}  max_runtime={cfg['max_runtime_seconds']:.0f}s")
+
+    print()
+    print("  Example: fit_lr_exponent(5e-3, {320: 1.5e-3, 512: 8e-4})")
+    gamma_example = fit_lr_exponent(5e-3, {320: 1.5e-3, 512: 8e-4})
+    print(f"  → γ = {gamma_example:.3f}")
 
     print()
     print("=" * 60)
     print("PHASE 3 — Scaling law sweep")
     print("(shown with placeholder proxy_lr=5e-3, exponent=1.0)")
     print("=" * 60)
-    total_seconds = 0
     for (hidden_size, num_hidden_layers), cfg in zip(
         [(h, l) for h, l in SCALING_FAMILIES
          for _ in COMPUTE_LEVELS_PER_FAMILY[(h, l)]],
@@ -227,7 +300,6 @@ if __name__ == "__main__":
         lr = cfg["optimizer_config"]["lr_scheduler"]["peak_value"]
         runtime = cfg["max_runtime_seconds"]
         actual_flops = 6 * N * D
-        total_seconds += runtime
         print(f"  d_model={hidden_size:3d}  layers={num_hidden_layers:2d}  "
               f"N={N:.2e}  D={D:.2e}  C={actual_flops:.1e}  "
               f"lr={lr:.2e}  max_runtime={runtime:.0f}s")
@@ -241,10 +313,14 @@ if __name__ == "__main__":
     phase1_seconds = sum(expected_seconds(c) for c in PHASE1_CONFIGS)
     phase2_seconds = sum(expected_seconds(c) for c in make_phase2_configs(5e-3))
     phase3_seconds = sum(expected_seconds(c) for c in make_phase3_configs(5e-3))
+    n_phase3 = len(make_phase3_configs(5e-3))
     print()
     print(f"Phase 1 expected:  {phase1_seconds/3600:.2f} B200-hours  ({len(PHASE1_CONFIGS)} runs)")
-    print(f"Phase 2 expected:  {phase2_seconds/3600:.2f} B200-hours  (3 runs)")
-    print(f"Phase 3 expected:  {phase3_seconds/3600:.2f} B200-hours  ({len(make_phase3_configs(5e-3))} runs)")
+    print(f"Phase 2 expected:  {phase2_seconds/3600:.2f} B200-hours  ({len(PHASE2_VERIFICATION_SIZES) * 3} runs)")
+    print(f"Phase 3 expected:  {phase3_seconds/3600:.2f} B200-hours  ({n_phase3} runs)")
     total = phase1_seconds + phase2_seconds + phase3_seconds
     print(f"Total expected:    {total/3600:.2f} B200-hours  (of 12 available)")
     print(f"Remaining buffer:  {12 - total/3600:.2f} B200-hours")
+    print()
+    print(f"At MFU=0.3 (pessimistic):  {total/3600 * (0.4/0.3):.2f} B200-hours  "
+          f"(buffer: {12 - total/3600 * (0.4/0.3):.2f})")
