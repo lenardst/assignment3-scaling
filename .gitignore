@@ -3,6 +3,13 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Phase results — checked-in only when the assignment is finished
+/data/smoke_test.json
+/data/phase1.json
+/data/phase2.json
+/data/phase3.json
+/data/predicted_optimal.json
+
 # C extensions
 *.so
 

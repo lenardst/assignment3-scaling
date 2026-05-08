@@ -65,13 +65,38 @@ def predict_optimal(E, A, B, alpha, beta, target_flops):
 
 
 def extract_results_from_api(api_experiments):
+    """Convert API experiment results into (N, D, final_loss) triples.
+
+    Accepts both Pydantic ExperimentResponse objects (from get_experiment / list_experiments)
+    and plain dicts (e.g. loaded from JSON via model_dump). Skips runs that have no
+    final loss, e.g. unfinished, failed without partial losses, or empty val_losses.
+    """
     results = []
     for exp in api_experiments:
-        cfg = exp["training_config"]
+        # Normalise to dict form so we can use a single code path.
+        if hasattr(exp, "model_dump"):
+            data = exp.model_dump(mode="json")
+        else:
+            data = exp
+
+        cfg = data["training_config"]
         arch = cfg["architecture_config"]
         N = non_embedding_params(arch["hidden_size"], arch["num_hidden_layers"])
         D = cfg["total_train_tokens"]
-        final_loss = exp["status"]["val_losses"][-1]
+
+        status = data["status"]
+        status_type = status.get("status_type")
+        if status_type == "completed" and status.get("val_losses"):
+            final_loss = status["val_losses"][-1]
+        elif status_type == "failed":
+            # Timeouts may still report partial val_losses; salvage the last one.
+            partial = status.get("reason", {}).get("partial_val_losses", [])
+            if not partial:
+                continue
+            final_loss = partial[-1]
+        else:
+            continue
+
         results.append({"N": N, "D": D, "final_loss": final_loss})
     return results
 

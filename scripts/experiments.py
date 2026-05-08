@@ -37,9 +37,12 @@ def round_tokens(n_tokens):
     return n_blocks * TOKENS_PER_EVAL_BLOCK
 
 
-def max_runtime_for(actual_flops, mfu=0.4, safety_factor=3.0):
+def max_runtime_for(actual_flops, mfu=0.4, safety_factor=1.5):
     # mfu=0.4: conservative estimate for small models on B200s (large models reach ~0.5).
-    # safety_factor=3.0: buffers against slow cluster startup and variable queue load.
+    # safety_factor=1.5: small but real margin. The API reserves max_runtime_seconds
+    # against the budget at submit time (refunded on completion), so safety_factor
+    # cannot be too generous — at 1.5×, MFU must be ≥ ~0.27 for runs to finish
+    # within the cap. The smoke test measures actual MFU before we commit Phase 3.
     # Hard cap at 2 hours prevents any single run from consuming the entire budget.
     return int(min(actual_flops / (mfu * B200_BF16_PEAK_FLOPS_PER_SECOND) * safety_factor, 2 * 3600))
 
@@ -102,7 +105,9 @@ def make_training_config(hidden_size, num_hidden_layers, peak_lr,
 SMOKE_TEST_CONFIG = make_training_config(
     hidden_size=PROXY_HIDDEN_SIZE,
     num_hidden_layers=2,
-    peak_lr=4e-3,
+    # 3.5e-3 is intentionally off the Phase 1 grid so the smoke test does not
+    # collide with a Phase 1 config (the API rejects duplicate submissions with 409).
+    peak_lr=3.5e-3,
     total_train_tokens=round_tokens(2e6),   # resolves to D_MIN_TOKENS (4 eval blocks)
     max_runtime_seconds=120,
 )
